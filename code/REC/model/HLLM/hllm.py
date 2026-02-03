@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
 import transformers
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, BitsAndBytesConfig
 from logging import getLogger
 
 from REC.utils.enum_type import InputType
@@ -26,6 +26,13 @@ from REC.model.HLLM.modeling_llama import LlamaForCausalLM
 from REC.model.HLLM.modeling_mistral import MistralForCausalLM
 from REC.model.HLLM.modeling_bert import BertModel
 from REC.model.HLLM.baichuan.modeling_baichuan import BaichuanForCausalLM
+
+fp8_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    bnb_8bit_quant_type="fp8", 
+    bnb_8bit_compute_dtype=torch.bfloat16, 
+    bnb_8bit_use_double_quant=True
+)
 
 
 class HLLM(BaseModel):
@@ -41,8 +48,10 @@ class HLLM(BaseModel):
         self.use_ft_flash_attn = config['use_ft_flash_attn']
         self.logger.info(f"create item llm")
         self.item_llm = self.create_llm(self.item_pretrain_dir, config['item_llm_init'])
+        print("[DEBUG]", self.item_llm.dtype)
         self.logger.info(f"create user llm")
         self.user_llm = self.create_llm(self.user_pretrain_dir, config['user_llm_init'])
+        print("[DEBUG]", self.user_llm.dtype)
         self.item_emb_token_n = config['item_emb_token_n']
         if self.item_emb_token_n > 1:
             raise NotImplementedError(f"Not support item_emb_token_n {self.item_emb_token_n} > 1")
@@ -89,7 +98,7 @@ class HLLM(BaseModel):
             self.logger.info(f'Using flash attention {hf_config.use_ft_flash_attn} for llama')
             self.logger.info(f'Init {init} for llama')
             if init:
-                return LlamaForCausalLM.from_pretrained(pretrain_dir, config=hf_config)
+                return LlamaForCausalLM.from_pretrained(pretrain_dir, config=hf_config, quantization_config=fp8_config)
             else:
                 return LlamaForCausalLM(config=hf_config).cuda()
         elif isinstance(hf_config, transformers.MistralConfig):
@@ -118,7 +127,7 @@ class HLLM(BaseModel):
                 return BaichuanForCausalLM(config=hf_config).cuda()
         else:
             return AutoModelForCausalLM.from_pretrained(
-                self.local_dir, config=hf_config
+                pretrain_dir, config=hf_config, quantization_config=fp8_config
             )
 
     def nce_loss(self, cur_embs, target_pos, target_neg, user_attention_mask):

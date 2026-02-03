@@ -28,6 +28,7 @@ training_arguments = [
     'epochs', 'train_batch_size',
     'optim_args',
     'eval_step', 'stopping_step',
+    'save_steps',
     'clip_grad_norm',
     'loss_decimal_place',
 ]

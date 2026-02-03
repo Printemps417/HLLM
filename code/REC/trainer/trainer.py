@@ -74,6 +74,8 @@ class Trainer(object):
         self.optimizer = self._build_optimizer()
         self.update_interval = config['update_interval'] if config['update_interval'] else 20
         self.scheduler_config = config['scheduler_args']
+        self.save_steps = config.get('save_steps', None)
+        self.global_step = 0
         if config['freeze_prefix'] or config['freeze_ad']:
             freeze_prefix = config['freeze_prefix'] if config['freeze_prefix'] else []
             if config['freeze_ad']:
@@ -172,7 +174,7 @@ class Trainer(object):
             optimizer = optim.AdamW(params, lr=self.optim_args['learning_rate'], weight_decay=self.optim_args['weight_decay'])
         return optimizer
 
-    def _train_epoch(self, train_data, epoch_idx, show_progress=False):
+    def _train_epoch(self, train_data, epoch_idx, show_progress=False, save_steps_enabled=False, verbose=True):
         self.model.train()
         total_loss = 0
         if self.rank == 0:
@@ -198,6 +200,9 @@ class Trainer(object):
             self.lite.backward(losses)
             grad_norm = self.optimizer.step()
             bwd_time = t.time()
+            self.global_step += 1
+            if save_steps_enabled and self.save_steps and self.global_step % self.save_steps == 0:
+                self._save_checkpoint(epoch_idx, verbose=verbose)
             if self.scheduler_config:
                 self.lr_scheduler.step()
             if show_progress and self.rank == 0 and batch_idx % self.update_interval == 0:
@@ -340,7 +345,14 @@ class Trainer(object):
             if self.config['need_training'] == None or self.config['need_training']:
                 train_data.sampler.set_epoch(epoch_idx)
                 training_start_time = time()
-                train_loss = self._train_epoch(train_data, epoch_idx, show_progress=show_progress)
+                save_steps_enabled = bool(saved and self.save_steps and self.save_steps > 0)
+                train_loss = self._train_epoch(
+                    train_data,
+                    epoch_idx,
+                    show_progress=show_progress,
+                    save_steps_enabled=save_steps_enabled,
+                    verbose=verbose
+                )
                 self.train_loss_dict[epoch_idx] = sum(train_loss) if isinstance(train_loss, tuple) else train_loss
                 training_end_time = time()
                 train_loss_output = \

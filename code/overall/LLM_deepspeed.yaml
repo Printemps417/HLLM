@@ -42,6 +42,7 @@ valid_metric: NDCG@200
 metric_decimal_place: 7
 eval_step: 1 
 stopping_step: 5
+save_steps: 20
 
 strategy: deepspeed
 precision: bf16-mixed

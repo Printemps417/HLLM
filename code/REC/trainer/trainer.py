@@ -10,6 +10,8 @@
 
 import os
 import sys
+import json
+import tempfile
 from logging import getLogger
 from time import time
 import time as t
@@ -412,7 +414,11 @@ class Trainer(object):
 
     @torch.no_grad()
     def _full_sort_batch_eval(self, batched_data):
-        user, time_seq, history_index, positive_u, positive_i = batched_data
+        user_ids = None
+        if len(batched_data) == 6:
+            user_ids, user, time_seq, history_index, positive_u, positive_i = batched_data
+        else:
+            user, time_seq, history_index, positive_u, positive_i = batched_data
         interaction = self.to_device(user)
         time_seq = self.to_device(time_seq)
         if self.config['model'] == 'HLLM':
@@ -426,7 +432,35 @@ class Trainer(object):
         scores[:, 0] = -np.inf
         if history_index is not None:
             scores[history_index] = -np.inf
-        return scores, positive_u, positive_i
+        return scores, positive_u, positive_i, user_ids
+
+    def _load_json_dict(self, path):
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _save_json_dict(self, path, data):
+        ensure_dir(os.path.dirname(path))
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_emb_", suffix=".json", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _as_float_list(self, tensor_1d):
+        return [float(x) for x in tensor_1d.tolist()]
+
+    def _get_id_token(self, id_array, idx):
+        if id_array is None:
+            return str(idx)
+        try:
+            return str(id_array[idx])
+        except Exception:
+            return str(idx)
 
     @torch.no_grad()
     def compute_item_feature(self, config, data):
@@ -491,6 +525,39 @@ class Trainer(object):
 
             self.tot_item_num = eval_data.dataset.dataload.item_num
             self.compute_item_feature(self.config, eval_data.dataset.dataload)
+
+            save_emb_json = self.config.get('save_emb_json', True)
+            emb_output_dir = self.config.get('emb_output_dir', self.checkpoint_dir)
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            rank = self.rank if torch.distributed.is_initialized() else 0
+            if world_size > 1:
+                user_json_path = os.path.join(emb_output_dir, f"rank{rank}_user_emb.json")
+                item_json_path = os.path.join(emb_output_dir, f"rank{rank}_item_emb.json")
+            else:
+                user_json_path = os.path.join(emb_output_dir, "user_emb.json")
+                item_json_path = os.path.join(emb_output_dir, "item_emb.json")
+
+            if save_emb_json:
+                user_emb_dict = self._load_json_dict(user_json_path)
+                item_emb_dict = self._load_json_dict(item_json_path)
+                id2token = getattr(eval_data.dataset.dataload, 'id2token', {})
+                user_id_map = id2token.get('user_id') if isinstance(id2token, dict) else None
+                item_id_map = id2token.get('item_id') if isinstance(id2token, dict) else None
+
+                if isinstance(self.item_feature, tuple):
+                    item_feature_tensor = self.item_feature[0]
+                else:
+                    item_feature_tensor = self.item_feature
+                item_feature_cpu = item_feature_tensor.detach().cpu()
+                for item_idx in range(item_feature_cpu.size(0)):
+                    item_key = self._get_id_token(item_id_map, item_idx)
+                    if item_key not in item_emb_dict:
+                        item_emb_dict[item_key] = self._as_float_list(item_feature_cpu[item_idx])
+            else:
+                user_emb_dict = None
+                item_emb_dict = None
+                user_id_map = None
+
             iter_data = (
                 tqdm(
                     eval_data,
@@ -504,12 +571,27 @@ class Trainer(object):
             for batch_idx, batched_data in enumerate(iter_data):
                 start_time = fwd_time
                 data_time = t.time()
-                scores, positive_u, positive_i = eval_func(batched_data)
+                scores, positive_u, positive_i, user_ids = eval_func(batched_data)
                 fwd_time = t.time()
 
                 if show_progress and self.rank == 0:
                     iter_data.set_postfix_str(f"data: {data_time-start_time:.3f} fwd: {fwd_time-data_time:.3f}", refresh=False)
                 self.eval_collector.eval_batch_collect(scores, positive_u, positive_i)
+
+                if save_emb_json and user_ids is not None:
+                    interaction = self.to_device(batched_data[1])
+                    time_seq = self.to_device(batched_data[2])
+                    if self.config['model'] == 'HLLM':
+                        if self.config['stage'] == 3:
+                            user_emb = self.model.module.compute_user_emb(interaction, time_seq, self.item_feature)
+                        else:
+                            user_emb = self.model((interaction, time_seq, self.item_feature), mode='compute_user_emb')
+                        user_emb_cpu = user_emb.detach().cpu()
+                        user_ids_cpu = user_ids.detach().cpu().numpy()
+                        for i, uid in enumerate(user_ids_cpu):
+                            user_key = self._get_id_token(user_id_map, int(uid))
+                            if user_key not in user_emb_dict:
+                                user_emb_dict[user_key] = self._as_float_list(user_emb_cpu[i])
             num_total_examples = len(eval_data.sampler.dataset)
             struct = self.eval_collector.get_data_struct()
             result = self.evaluator.evaluate(struct)
@@ -519,5 +601,9 @@ class Trainer(object):
                 result_cpu = self.distributed_concat(torch.tensor([v]).to(self.device), num_total_examples).cpu()
                 result[k] = round(result_cpu.item(), metric_decimal_place)
             self.wandblogger.log_eval_metrics(result, head='eval')
+
+            if save_emb_json:
+                self._save_json_dict(user_json_path, user_emb_dict)
+                self._save_json_dict(item_json_path, item_emb_dict)
 
             return result

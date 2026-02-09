@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import argparse
 import json
+import tempfile
 import tqdm
 
 import torch
@@ -92,6 +93,42 @@ def forward(
     return seq_user_emb
 
 
+def _load_json_dict(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_json_dict(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_emb_", suffix=".json", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _normalize_id(value, fallback):
+    if value is None:
+        return str(fallback)
+    return str(value)
+
+
+def _extract_user_id(row_dict, fallback):
+    for key in ("user_id", "uid", "user"):
+        if key in row_dict and row_dict[key] is not None:
+            return _normalize_id(row_dict[key], fallback)
+    return _normalize_id(None, fallback)
+
+
+def _as_float_list(tensor_1d):
+    return [float(x) for x in tensor_1d.tolist()]
+
+
 def worker(gpu_id, df):
     config = Config(config_file_list=args.config_file)
     if len(extra_args):
@@ -107,7 +144,13 @@ def worker(gpu_id, df):
     hllm.eval()
     hllm = hllm.to(f'cuda:{gpu_id}').bfloat16().eval()
 
+    user_json_path = f"{args.output_path}/rank{gpu_id}_user_emb.json"
+    item_json_path = f"{args.output_path}/rank{gpu_id}_item_emb.json"
+    user_emb_dict = _load_json_dict(user_json_path)
+    item_emb_dict = _load_json_dict(item_json_path)
+
     input_embeds, bs_data = [], []
+    user_ids_batch = []
     with torch.no_grad(), torch.amp.autocast(dtype=torch.bfloat16, device_type="cuda"):
         for idx, row in tqdm.tqdm(
             df.iterrows(), total=len(df), position=gpu_id, leave=True, ncols=150
@@ -116,21 +159,61 @@ def worker(gpu_id, df):
             cur_data = processor.process(row)
             if cur_data is None:
                 continue
+            user_ids_batch.append(_extract_user_id(row, idx))
             bs_data.append(cur_data)
             if len(bs_data) >= args.batch_size:
                 bs_data = customize_rmpad_collate(bs_data)
                 bs_data = {k: v.to(f'cuda:{gpu_id}') for k, v in bs_data.items()}
                 seq_user_emb = forward(hllm, **bs_data)
                 input_embeds.append(seq_user_emb.float())
+
+                seq_user_emb_cpu = seq_user_emb.detach().cpu()
+                for i, uid in enumerate(user_ids_batch):
+                    if uid not in user_emb_dict:
+                        user_emb_dict[uid] = _as_float_list(seq_user_emb_cpu[i])
+
+                if hllm.user_emb_type == 'id_seq' and 'input_id_list' in bs_data:
+                    input_id_list = bs_data['input_id_list'].detach().cpu().numpy()
+                    item_embs = hllm.item_embedding(bs_data['input_id_list']).detach().cpu()
+                    for row_idx in range(input_id_list.shape[0]):
+                        for col_idx in range(input_id_list.shape[1]):
+                            item_id = int(input_id_list[row_idx, col_idx])
+                            if item_id <= 0:
+                                continue
+                            key = str(item_id)
+                            if key not in item_emb_dict:
+                                item_emb_dict[key] = _as_float_list(item_embs[row_idx, col_idx])
+
                 bs_data = []
+                user_ids_batch = []
         if len(bs_data) > 0:
             bs_data = customize_rmpad_collate(bs_data)
             bs_data = {k: v.to(f'cuda:{gpu_id}') for k, v in bs_data.items()}
             seq_user_emb = forward(hllm, **bs_data)
             input_embeds.append(seq_user_emb.float())
+
+            seq_user_emb_cpu = seq_user_emb.detach().cpu()
+            for i, uid in enumerate(user_ids_batch):
+                if uid not in user_emb_dict:
+                    user_emb_dict[uid] = _as_float_list(seq_user_emb_cpu[i])
+
+            if hllm.user_emb_type == 'id_seq' and 'input_id_list' in bs_data:
+                input_id_list = bs_data['input_id_list'].detach().cpu().numpy()
+                item_embs = hllm.item_embedding(bs_data['input_id_list']).detach().cpu()
+                for row_idx in range(input_id_list.shape[0]):
+                    for col_idx in range(input_id_list.shape[1]):
+                        item_id = int(input_id_list[row_idx, col_idx])
+                        if item_id <= 0:
+                            continue
+                        key = str(item_id)
+                        if key not in item_emb_dict:
+                            item_emb_dict[key] = _as_float_list(item_embs[row_idx, col_idx])
+
     input_embeds = torch.cat(input_embeds, dim=0)
     print(f"{input_embeds.size() = }")
     torch.save(input_embeds, f"{args.output_path}/rank{gpu_id}_user_emb.pt")
+    _save_json_dict(user_json_path, user_emb_dict)
+    _save_json_dict(item_json_path, item_emb_dict)
 
 
 def distribute_work(df, num_gpus):

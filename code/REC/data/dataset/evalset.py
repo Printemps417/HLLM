@@ -19,6 +19,7 @@ class SeqEvalDataset(Dataset):
     def __init__(self, config, dataload, phase='valid'):
         self.dataload = dataload
         self.max_item_list_length = config['MAX_ITEM_LIST_LENGTH_TEST'] if config['MAX_ITEM_LIST_LENGTH_TEST'] else config['MAX_ITEM_LIST_LENGTH']
+        self.user_ids = list(dataload.user_seq.keys())
         self.user_seq = list(dataload.user_seq.values())
         self.time_seq = list(dataload.time_seq.values())
         self.use_time = config['use_time']
@@ -49,6 +50,7 @@ class SeqEvalDataset(Dataset):
 
     def __getitem__(self, index):
         last_num = 2 if self.phase == 'valid' else 1
+        user_id = self.user_ids[index]
         history_seq = self.user_seq[index][:-last_num]
         item_seq = self._padding_sequence(history_seq, self.max_item_list_length)
         item_target = self.user_seq[index][-last_num]
@@ -58,4 +60,4 @@ class SeqEvalDataset(Dataset):
             history_time_seq = []
         time_seq = self._padding_time_sequence(history_time_seq, self.max_item_list_length)
 
-        return torch.tensor(history_seq), item_seq, item_target, time_seq  # , item_length
+        return user_id, torch.tensor(history_seq), item_seq, item_target, time_seq  # , item_length

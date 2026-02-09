@@ -68,6 +68,7 @@ def customize_collate(batch):
 
 
 def seq_eval_collate(batch):
+    user_ids = []
     item_seq = []
     item_target = []
     time_seq = []
@@ -75,10 +76,11 @@ def seq_eval_collate(batch):
     history_i = []
 
     for item in batch:
-        history_i.append(item[0])
-        item_seq.append(item[1])
-        item_target.append(item[2])
-        time_seq.append(item[3])
+        user_ids.append(item[0])
+        history_i.append(item[1])
+        item_seq.append(item[2])
+        item_target.append(item[3])
+        time_seq.append(item[4])
 
     history_u = torch.cat([torch.full_like(hist_iid, i) for i, hist_iid in enumerate(history_i)])
     history_i = torch.cat(history_i)
@@ -86,10 +88,11 @@ def seq_eval_collate(batch):
     item_seq = torch.tensor(item_seq)  # [batch, len]
     item_target = torch.tensor(item_target)  # [batch]
     time_seq = torch.tensor(time_seq)  # [batch]
+    user_ids = torch.tensor(user_ids)  # [batch]
     positive_u = torch.arange(item_seq.shape[0])  # [batch]
 
     # return item_seq, None, positive_u, item_target
-    return item_seq, time_seq, (history_u, history_i), positive_u, item_target
+    return user_ids, item_seq, time_seq, (history_u, history_i), positive_u, item_target
 
 
 def customize_rmpad_collate(batch):

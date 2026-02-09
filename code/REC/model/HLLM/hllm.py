@@ -190,6 +190,8 @@ class HLLM(BaseModel):
     def forward(self, interaction, mode='train'):
         if mode == 'predict':
             return self.predict(interaction[0], interaction[1], interaction[2])
+        if mode == 'compute_user_emb':
+            return self.compute_user_emb(interaction[0], interaction[1], interaction[2])
         if mode == 'compute_item':
             return self.compute_item(interaction)
         user_attention_mask = interaction['attention_mask']
@@ -230,6 +232,17 @@ class HLLM(BaseModel):
         item_feature = item_feature / item_feature.norm(dim=-1, keepdim=True)
 
         return torch.matmul(seq_output, item_feature.t())
+
+    @torch.no_grad()
+    def compute_user_emb(self, item_seq, time_seq, item_feature):
+        attention_mask = (item_seq > 0).int()
+
+        pos_embedding = item_feature[item_seq]
+
+        user_embedding = self.user_llm(inputs_embeds=pos_embedding, attention_mask=attention_mask).hidden_states[-1]
+        seq_output = user_embedding[:, -1]
+        seq_output = seq_output / seq_output.norm(dim=-1, keepdim=True)
+        return seq_output
 
     @torch.no_grad()
     def compute_item_all(self):

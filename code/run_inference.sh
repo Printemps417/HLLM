@@ -1,4 +1,4 @@
-BASE_PATH=${1:-/home/runoob/repo}
+BASE_PATH=${1:-/root/runoob/repo}
 
 python3 main.py \
 --config_file overall/LLM_deepspeed.yaml HLLM/HLLM.yaml \
